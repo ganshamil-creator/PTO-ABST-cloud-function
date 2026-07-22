@@ -7,8 +7,10 @@ FROM python:3.11-slim
 
 # Java нужна ТОЛЬКО из-за OpenDataLoader (он спавнит JVM-процесс изнутри
 # Python-обёртки). Ставим headless JRE — GUI не нужен, размер поменьше.
+# openjdk-17 в текущей репе Debian (trixie) больше недоступен — берём 21-ю,
+# она тоже подходит (OpenDataLoader требует Java 17+).
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends openjdk-17-jre-headless && \
+    apt-get install -y --no-install-recommends openjdk-21-jre-headless && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
