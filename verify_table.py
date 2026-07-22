@@ -191,6 +191,105 @@ def verify_table(table: dict, tolerance_ratio: float = 0.005) -> VerifyReport:
     return report
 
 
+# ---------------------------------------------------------------------------
+# Резервная оценка объёма по массе элементов
+# ---------------------------------------------------------------------------
+# Многие спецификации (например, "Спецификация к схеме расположения свай")
+# не содержат строки/колонки "Итого"/"Всего" вообще — там просто построчный
+# список марок с количеством и массой единицы. verify_table() в этом случае
+# не находит, что сверять, и по чистой таблице объём в м3 никак не получить
+# без расшифровки кода марки элемента (а это ненадёжно и специфично для
+# каждого типа изделия).
+#
+# Но если в таблице есть колонки "Кол-во" и "Масса ед., кг" — можно посчитать
+# суммарную массу по всем строкам и перевести её в объём через плотность
+# материала. Это не заменяет данные с чертежа, а даёт оценку, которую нужно
+# явно пометить как расчётную.
+
+_QTY_HEADER_WORDS = ("кол.", "кол-во", "количество", "шт.")
+_UNIT_MASS_HEADER_WORDS = ("масса ед", "масса, кг", "масса единицы", "вес ед")
+
+# Плотности по умолчанию для типовых материалов ЖБИ (кг/м3). При необходимости
+# можно передать свою плотность явным аргументом в estimate_volume_from_mass().
+DEFAULT_DENSITY_KG_M3 = 2500.0  # тяжёлый бетон/ж/б
+
+
+def _merged_header(grid: list[list[str]], header_rows: int = 2) -> list[str]:
+    """Склеивает первые header_rows строк таблицы в один заголовок на колонку —
+    у сложных спецификаций подпись колонки нередко разбита на 2 строки
+    ("Масса" / "ед., кг")."""
+    ncols = max((len(r) for r in grid), default=0)
+    merged = ["" for _ in range(ncols)]
+    for ri in range(min(header_rows, len(grid))):
+        row = grid[ri]
+        for ci in range(ncols):
+            cell = row[ci] if ci < len(row) else ""
+            if cell:
+                merged[ci] = (merged[ci] + " " + cell).strip()
+    return merged
+
+
+@dataclass
+class MassEstimate:
+    quantity_col: int
+    mass_col: int
+    quantity_label: str
+    mass_label: str
+    total_mass_kg: float
+    volume_m3: float
+    density_kg_m3: float
+    rows_used: int
+    rows_skipped: int
+
+
+def estimate_volume_from_mass(
+    grid: list[list[str]],
+    density_kg_m3: float = DEFAULT_DENSITY_KG_M3,
+    header_rows: int = 2,
+) -> MassEstimate | None:
+    """Ищет в таблице колонки количества и массы единицы, считает суммарную
+    массу и переводит в объём. Возвращает None, если подходящих колонок нет
+    или ни одной строки не удалось посчитать."""
+    headers = _merged_header(grid, header_rows)
+
+    qty_col = mass_col = None
+    for ci, h in enumerate(headers):
+        hl = h.lower()
+        if qty_col is None and any(w in hl for w in _QTY_HEADER_WORDS):
+            qty_col = ci
+        if mass_col is None and any(w in hl for w in _UNIT_MASS_HEADER_WORDS):
+            mass_col = ci
+    if qty_col is None or mass_col is None:
+        return None
+
+    total_mass = 0.0
+    rows_used = 0
+    rows_skipped = 0
+    for row in grid[header_rows:]:
+        qty = _to_number(row[qty_col] if qty_col < len(row) else "")
+        mass = _to_number(row[mass_col] if mass_col < len(row) else "")
+        if qty is None or mass is None:
+            rows_skipped += 1
+            continue
+        total_mass += qty * mass
+        rows_used += 1
+
+    if rows_used == 0:
+        return None
+
+    return MassEstimate(
+        quantity_col=qty_col,
+        mass_col=mass_col,
+        quantity_label=headers[qty_col],
+        mass_label=headers[mass_col],
+        total_mass_kg=round(total_mass, 2),
+        volume_m3=round(total_mass / density_kg_m3, 4),
+        density_kg_m3=density_kg_m3,
+        rows_used=rows_used,
+        rows_skipped=rows_skipped,
+    )
+
+
 if __name__ == "__main__":
     import sys
     import json
@@ -215,3 +314,11 @@ if __name__ == "__main__":
             for c in rep.checks:
                 status = "OK" if c.match else "!! РАСХОЖДЕНИЕ"
                 print(f"  [{status}] {c.kind} '{c.label}': заявлено {c.stated}, сумма компонентов {c.computed}")
+        else:
+            grid = _grid(t)
+            est = estimate_volume_from_mass(grid)
+            if est:
+                print(f"\nТаблица {t.get('id')} — строк 'Итого' нет, оценка по массе:")
+                print(f"  колонки: '{est.quantity_label}' x '{est.mass_label}'")
+                print(f"  суммарная масса: {est.total_mass_kg} кг (строк учтено {est.rows_used}, пропущено {est.rows_skipped})")
+                print(f"  объём (плотность {est.density_kg_m3} кг/м3): {est.volume_m3} м3")

@@ -46,7 +46,7 @@ import functions_framework
 from flask import Request, jsonify
 
 import opendataloader_pdf
-from verify_table import verify_table, _grid  # тот же модуль, что и в takeoff_pipeline.py
+from verify_table import verify_table, _grid, estimate_volume_from_mass  # тот же модуль, что и в takeoff_pipeline.py
 
 
 def _cors_headers():
@@ -80,6 +80,13 @@ def extract_and_verify_tables(request: Request):
     upload = request.files["file"]
     section_code = request.form.get("section_code", "")
     pages = request.form.get("pages", "")  # опционально: "1,3,5-7"
+    # Плотность материала для резервной оценки объёма по массе (кг/м3).
+    # По умолчанию — тяжёлый бетон/ж/б (2500). Для металлопроката, например,
+    # нужно передать 7850.
+    try:
+        density_kg_m3 = float(request.form.get("density_kg_m3", "2500") or 2500)
+    except ValueError:
+        density_kg_m3 = 2500.0
 
     warnings: list[str] = []
 
@@ -113,6 +120,28 @@ def extract_and_verify_tables(request: Request):
         if t.get("number of rows", 0) < 3 or t.get("number of columns", 0) < 2:
             continue
         report = verify_table(t)
+
+        # Если в таблице нет строки/колонки "Итого"/"Всего" — сверить нечего,
+        # но объём часто всё равно можно оценить через Кол-во x Масса ед.
+        # (типичный случай — спецификации свай/подушек/приямков без итоговой
+        # строки). Явно помечаем это как расчётную оценку, а не факт с чертежа.
+        mass_estimate = None
+        if not report.checks:
+            est = estimate_volume_from_mass(grid, density_kg_m3=density_kg_m3)
+            if est is not None:
+                mass_estimate = {
+                    "note": "Итоговой строки в таблице нет — объём получен расчётом "
+                            "(Кол-во x Масса ед.) / плотность, а не взят с чертежа. "
+                            "Перепроверьте перед использованием.",
+                    "quantity_column": est.quantity_label,
+                    "mass_column": est.mass_label,
+                    "total_mass_kg": est.total_mass_kg,
+                    "density_kg_m3": est.density_kg_m3,
+                    "volume_m3": est.volume_m3,
+                    "rows_used": est.rows_used,
+                    "rows_skipped": est.rows_skipped,
+                }
+
         out_tables.append({
             "id": t.get("id"),
             "page": t.get("page number"),
@@ -130,6 +159,7 @@ def extract_and_verify_tables(request: Request):
                     for c in report.checks
                 ],
             },
+            "mass_estimate": mass_estimate,
         })
 
     return (jsonify({"tables": out_tables, "warnings": warnings, "section_code": section_code}), 200, headers)
