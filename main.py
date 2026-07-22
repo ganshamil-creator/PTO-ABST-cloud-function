@@ -95,7 +95,7 @@ def extract_and_verify_tables(request: Request):
         upload.save(pdf_path)
 
         try:
-            kwargs = dict(input_path=pdf_path, output_dir=tmpdir, format="json", quiet=True)
+            kwargs = dict(input_path=pdf_path, output_dir=tmpdir, format="json", quiet=True, table_method="cluster")
             if pages:
                 kwargs["pages"] = pages
             opendataloader_pdf.convert(**kwargs)
