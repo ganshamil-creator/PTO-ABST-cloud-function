@@ -3,16 +3,24 @@ main.py — Cloud Function backend для «Помогатора»
 ====================================================
 Единственная причина, по которой это отдельная функция, а не часть браузера:
 OpenDataLoader написан на Java и требует JVM — в браузере это физически не
-запустить (см. обсуждение). Всё остальное (чтение векторного текста, Gemini)
-по-прежнему работает прямо в браузере без этого сервера.
+запустить (см. обсуждение). Всё остальное (чтение векторного текста) по-прежнему
+работает прямо в браузере без этого сервера.
+
+Второй эндпоинт этой же функции — /gemini-proxy — появился позже: браузер бьётся
+в Gemini API напрямую своим IP, а Google блокирует запросы по гео-локации этого
+IP ("User location is not supported for the API use") для ряда регионов. Через
+Cloud Run запрос до Gemini идёт с IP датацентра Google Cloud (обычно в
+разрешённом регионе), а не с IP пользователя — так что для тех, кого блокирует
+напрямую, это единственный обходной путь без постоянного VPN.
 
 Деплой (Google Cloud Functions, 2-е поколение, тот же способ через GitHub,
 которым вы уже пользуетесь для остального):
   Точка входа: extract_and_verify_tables
   Runtime: Python 3.11+
-  Требуется: Java 17+ в среде выполнения (см. requirements.txt и README ниже)
+  Требуется: Java 17+ в среде выполнения (см. requirements.txt и README ниже);
+  requirements.txt должен включать "requests" (для /gemini-proxy)
 
-Вызов из браузера:
+Вызов из браузера (таблицы, как и раньше):
   POST <URL функции>
   Content-Type: multipart/form-data
   Поле файла: "file" (сам PDF)
@@ -33,6 +41,15 @@ OpenDataLoader написан на Java и требует JVM — в брауз�
     ],
     "warnings": ["..."]   # например, если конвертация упала на конкретной странице
   }
+
+Вызов из браузера (Gemini-прокси, новое):
+  POST <URL функции>/gemini-proxy
+  Content-Type: application/json
+  Тело: {"model": "gemini-2.5-flash", "apiKey": "...", "body": {...тело запроса к Gemini как есть...}}
+
+Функция ничего не сохраняет — ключ и тело просто пробрасываются в Gemini и
+ответ возвращается как есть (плюс поле error.proxyError при сетевой ошибке
+самого прокси, отдельно от обычных ошибок Gemini API).
 """
 
 from __future__ import annotations
@@ -43,10 +60,13 @@ import tempfile
 import traceback
 
 import functions_framework
+import requests
 from flask import Request, jsonify
 
 import opendataloader_pdf
 from verify_table import verify_table, _grid, estimate_volume_from_mass  # тот же модуль, что и в takeoff_pipeline.py
+
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
 def _cors_headers():
@@ -66,6 +86,35 @@ def _find_tables(node, results):
         _find_tables(kid, results)
 
 
+def _gemini_proxy(request: Request, headers: dict):
+    try:
+        payload = request.get_json(force=True, silent=False)
+    except Exception:
+        return (jsonify({"error": {"proxyError": "Тело запроса не JSON"}}), 400, headers)
+
+    if not payload or not payload.get("model") or not payload.get("apiKey") or "body" not in payload:
+        return (jsonify({"error": {"proxyError": "Нужны поля model, apiKey, body"}}), 400, headers)
+
+    url = f"{GEMINI_API_BASE}/{payload['model']}:generateContent"
+    try:
+        upstream = requests.post(
+            url,
+            headers={"Content-Type": "application/json", "x-goog-api-key": payload["apiKey"]},
+            json=payload["body"],
+            timeout=120,
+        )
+    except requests.RequestException as e:
+        return (jsonify({"error": {"proxyError": f"Не достучались до Gemini API: {e}"}}), 502, headers)
+
+    # Отдаём ответ Gemini как есть (и код статуса, и тело) — браузер сам разбирает
+    # data.error/data.candidates ровно так же, как при прямом вызове раньше.
+    try:
+        body = upstream.json()
+    except ValueError:
+        body = {"error": {"proxyError": f"Gemini вернула не-JSON (код {upstream.status_code}): {upstream.text[:300]}"}}
+    return (jsonify(body), upstream.status_code, headers)
+
+
 @functions_framework.http
 def extract_and_verify_tables(request: Request):
     # CORS preflight
@@ -73,6 +122,9 @@ def extract_and_verify_tables(request: Request):
         return ("", 204, _cors_headers())
 
     headers = _cors_headers()
+
+    if request.path.rstrip("/").endswith("/gemini-proxy"):
+        return _gemini_proxy(request, headers)
 
     if "file" not in request.files:
         return (jsonify({"error": "Поле 'file' (PDF) не найдено в запросе"}), 400, headers)
