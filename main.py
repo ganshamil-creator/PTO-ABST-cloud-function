@@ -13,12 +13,29 @@ Cloud Run запрос до Gemini идёт с IP датацентра Google Cl
 разрешённом регионе), а не с IP пользователя — так что для тех, кого блокирует
 напрямую, это единственный обходной путь без постоянного VPN.
 
+БЕЗОПАСНОСТЬ КЛЮЧА (важное изменение): раньше клиент (браузер) присылал свой
+Gemini API-ключ в теле каждого запроса к /gemini-proxy — то есть ключ был виден
+в DevTools/Network любому, у кого открыт HTML-файл, даже без учёта того, что
+Google его так и не видел напрямую. Теперь ключ живёт ТОЛЬКО на сервере — в
+переменной окружения GEMINI_API_KEY этой Cloud Function — и клиент его вообще
+не присылает. Поле "apiKey" в теле запроса от браузера больше не требуется и
+игнорируется, если всё же придёт (например от старой версии HTML-файла).
+
+Как задать ключ на сервере (Cloud Run / Cloud Functions 2-го поколения):
+  Быстрый способ: в консоли сервиса → "Переменные среды и секреты" → добавить
+    переменную окружения GEMINI_API_KEY со значением ключа → Deploy.
+  Более безопасный способ: положить ключ в Google Secret Manager, затем в том
+    же разделе консоли выбрать "Reference a secret" вместо обычной переменной —
+    тогда сырое значение ключа не будет храниться в конфигурации сервиса.
+
 Деплой (Google Cloud Functions, 2-е поколение, тот же способ через GitHub,
 которым вы уже пользуетесь для остального):
   Точка входа: extract_and_verify_tables
   Runtime: Python 3.11+
   Требуется: Java 17+ в среде выполнения (см. requirements.txt и README ниже);
   requirements.txt должен включать "requests" (для /gemini-proxy)
+  Обязательная переменная окружения: GEMINI_API_KEY (см. выше — без неё
+  /gemini-proxy будет отвечать 500 с понятным текстом ошибки, а не тихо падать)
 
 Вызов из браузера (таблицы, как и раньше):
   POST <URL функции>
@@ -42,14 +59,16 @@ Cloud Run запрос до Gemini идёт с IP датацентра Google Cl
     "warnings": ["..."]   # например, если конвертация упала на конкретной странице
   }
 
-Вызов из браузера (Gemini-прокси, новое):
+Вызов из браузера (Gemini-прокси):
   POST <URL функции>/gemini-proxy
   Content-Type: application/json
-  Тело: {"model": "gemini-2.5-flash", "apiKey": "...", "body": {...тело запроса к Gemini как есть...}}
+  Тело: {"model": "gemini-2.5-flash", "body": {...тело запроса к Gemini как есть...}}
+  (поле "apiKey" от клиента больше не требуется — см. "БЕЗОПАСНОСТЬ КЛЮЧА" выше)
 
-Функция ничего не сохраняет — ключ и тело просто пробрасываются в Gemini и
-ответ возвращается как есть (плюс поле error.proxyError при сетевой ошибке
-самого прокси, отдельно от обычных ошибок Gemini API).
+Функция ничего не сохраняет — тело запроса просто пробрасывается в Gemini вместе
+с серверным ключом, и ответ возвращается как есть (плюс поле error.proxyError
+при сетевой/конфигурационной ошибке самого прокси, отдельно от обычных ошибок
+Gemini API).
 """
 
 from __future__ import annotations
@@ -67,6 +86,11 @@ import opendataloader_pdf
 from verify_table import verify_table, _grid, estimate_volume_from_mass  # тот же модуль, что и в takeoff_pipeline.py
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+
+# Ключ читается ОДИН РАЗ при старте инстанса из переменной окружения — клиент
+# его больше не присылает (см. докстринг модуля). Если переменная не задана,
+# /gemini-proxy отвечает понятной ошибкой 500 вместо непонятного 401 от Gemini.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 
 def _cors_headers():
@@ -87,19 +111,29 @@ def _find_tables(node, results):
 
 
 def _gemini_proxy(request: Request, headers: dict):
+    if not GEMINI_API_KEY:
+        return (
+            jsonify({"error": {"proxyError": "GEMINI_API_KEY не задан на сервере — добавьте переменную окружения в настройках Cloud Run/Cloud Function и передеплойте"}}),
+            500,
+            headers,
+        )
+
     try:
         payload = request.get_json(force=True, silent=False)
     except Exception:
         return (jsonify({"error": {"proxyError": "Тело запроса не JSON"}}), 400, headers)
 
-    if not payload or not payload.get("model") or not payload.get("apiKey") or "body" not in payload:
-        return (jsonify({"error": {"proxyError": "Нужны поля model, apiKey, body"}}), 400, headers)
+    # "apiKey" от клиента больше не требуется и не используется, даже если
+    # придёт (например от старой версии HTML-файла, ещё не обновлённой) —
+    # сервер всегда использует свой собственный GEMINI_API_KEY.
+    if not payload or not payload.get("model") or "body" not in payload:
+        return (jsonify({"error": {"proxyError": "Нужны поля model, body"}}), 400, headers)
 
     url = f"{GEMINI_API_BASE}/{payload['model']}:generateContent"
     try:
         upstream = requests.post(
             url,
-            headers={"Content-Type": "application/json", "x-goog-api-key": payload["apiKey"]},
+            headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
             json=payload["body"],
             timeout=120,
         )
