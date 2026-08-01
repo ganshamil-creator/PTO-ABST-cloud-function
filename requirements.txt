@@ -2,3 +2,4 @@ functions-framework==3.*
 flask==3.*
 opendataloader-pdf
 requests==2.*
+pymupdf
