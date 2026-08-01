@@ -65,6 +65,37 @@ Google его так и не видел напрямую. Теперь ключ 
   Тело: {"model": "gemini-2.5-flash", "body": {...тело запроса к Gemini как есть...}}
   (поле "apiKey" от клиента больше не требуется — см. "БЕЗОПАСНОСТЬ КЛЮЧА" выше)
 
+Вызов из браузера (векторная геометрия размерных цепочек, новое):
+  POST <URL функции>/vector-geometry
+  Content-Type: multipart/form-data
+  Поле файла: "file" (сам PDF)
+  Необязательное поле: "pages" (например "1,2" — по умолчанию первые 3 страницы)
+
+  ЗАЧЕМ: на чертежах по ГОСТ 21.501 засечки размерных линий — короткие отрезки
+  под 45° (а не стрелки, как в машиностроительных чертежах) — рисуются в PDF как
+  самая обычная векторная геометрия с точными координатами. Если чертёж
+  экспортирован из CAD (не скан), эти координаты можно измерить напрямую и
+  перевести в миллиметры арифметикой — без OCR/vision, без риска перепутать
+  цифру или пропустить короткий отрезок в цепочке (см. обсуждение и валидацию
+  на реальном чертеже — geometrически найденная сумма разошлась с проверенным
+  вручную значением всего на 10мм из 53100). Браузер сам не может пройтись по
+  низкоуровневому потоку операций PDF так же удобно, как PyMuPDF на сервере —
+  поэтому это отдельный серверный эндпоинт, а не код в самом HTML.
+
+  Ответ (JSON):
+  {
+    "chains": [
+      {"page": 1, "orientation": "row"|"col", "pos_pt": 133.1, "points_pt": [x0, x1, ...], "n_points": 6}
+    ],
+    "warnings": ["..."]
+  }
+  points_pt — координаты последовательных засечек вдоль цепочки в pt (1/72 дюйма,
+  стандартная единица PDF); orientation "row" — цепочка идёт горизонтально
+  (points_pt — это X-координаты, все на одной Y), "col" — вертикально (points_pt
+  — Y-координаты, все на одном X). Дальнейшая калибровка масштаба (мм за pt) и
+  сопоставление с конкретным полем (length_axis_grid_mm и т.п.) — на стороне
+  браузера, там уже есть показания Gemini для калибровки.
+
 Функция ничего не сохраняет — тело запроса просто пробрасывается в Gemini вместе
 с серверным ключом, и ответ возвращается как есть (плюс поле error.proxyError
 при сетевой/конфигурационной ошибке самого прокси, отдельно от обычных ошибок
@@ -74,11 +105,14 @@ Gemini API).
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 import traceback
+from collections import defaultdict
 
 import functions_framework
+import fitz  # PyMuPDF — добавьте "pymupdf" в requirements.txt
 import requests
 from flask import Request, jsonify
 
@@ -156,6 +190,116 @@ def _gemini_proxy(request: Request, headers: dict):
     return (jsonify(body), upstream.status_code, headers)
 
 
+def _find_ticks(page, min_len=3, max_len=20):
+    """Короткие отрезки под ~45° (катеты примерно равны) — это и есть засечки
+    ГОСТ 21.501, которыми в строительных чертежах оканчиваются размерные и
+    выносные линии (в отличие от стрелок в машиностроительных чертежах)."""
+    drawings = page.get_drawings()
+    ticks = []
+    for d in drawings:
+        if not d.get("width"):
+            continue
+        for it in d["items"]:
+            if it[0] != "l":
+                continue
+            p1, p2 = it[1], it[2]
+            dx, dy = p2.x - p1.x, p2.y - p1.y
+            length = math.hypot(dx, dy)
+            if min_len < length < max_len and abs(dx) > 0.5 and abs(dy) > 0.5:
+                ratio = abs(dx) / abs(dy)
+                if 0.6 < ratio < 1.6:
+                    ticks.append(((p1.x + p2.x) / 2, (p1.y + p2.y) / 2))
+    return ticks
+
+
+def _cluster_1d(ticks, key_idx, tol=1.5):
+    """Группирует засечки в строки (по Y) или столбцы (по X) — точки, лежащие
+    примерно на одной прямой, перпендикулярной направлению цепочки."""
+    other_idx = 1 - key_idx
+    sorted_t = sorted(ticks, key=lambda t: t[key_idx])
+    groups = []
+    cur = [sorted_t[0]]
+    for t in sorted_t[1:]:
+        if t[key_idx] - cur[-1][key_idx] < tol:
+            cur.append(t)
+        else:
+            groups.append(cur)
+            cur = [t]
+    groups.append(cur)
+    result = []
+    for g in groups:
+        points = sorted(set(round(t[other_idx], 1) for t in g))
+        if len(points) >= 4:  # цепочка меньше 4 точек — не размерная сетка, а случайность
+            pos = sum(t[key_idx] for t in g) / len(g)
+            result.append((pos, points))
+    return result
+
+
+def _find_dimension_chains(page):
+    """Возвращает построчные и постолбцовые цепочки засечек — кандидаты на
+    размерные цепочки (сетка осей, добавки и т.п.). Калибровка масштаба (pt->мм)
+    и сопоставление с конкретными полями делается на клиенте, где уже есть
+    показания Gemini для калибровки — сервер отдаёт только сырую геометрию."""
+    ticks = _find_ticks(page)
+    if len(ticks) < 8:
+        return []
+    rows = _cluster_1d(ticks, key_idx=1)  # группируем по Y -> горизонтальные цепочки
+    cols = _cluster_1d(ticks, key_idx=0)  # группируем по X -> вертикальные цепочки
+    chains = []
+    for y, xs in rows:
+        chains.append({"orientation": "row", "pos_pt": round(y, 1), "points_pt": xs, "n_points": len(xs)})
+    for x, ys in cols:
+        chains.append({"orientation": "col", "pos_pt": round(x, 1), "points_pt": ys, "n_points": len(ys)})
+    return chains
+
+
+def _parse_pages_param(pages_str, page_count, default_max=3):
+    if not pages_str:
+        return list(range(min(page_count, default_max)))
+    result = []
+    for part in pages_str.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-")
+            result.extend(range(int(a) - 1, int(b)))
+        else:
+            result.append(int(part) - 1)
+    return [p for p in result if 0 <= p < page_count]
+
+
+def _vector_geometry(request: Request, headers: dict):
+    if "file" not in request.files:
+        return (jsonify({"error": "Поле 'file' (PDF) не найдено в запросе"}), 400, headers)
+
+    upload = request.files["file"]
+    pages_param = request.form.get("pages", "")
+    warnings: list[str] = []
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pdf_path = os.path.join(tmpdir, "input.pdf")
+        upload.save(pdf_path)
+        try:
+            doc = fitz.open(pdf_path)
+        except Exception as e:
+            return (jsonify({"error": f"Не удалось открыть PDF (PyMuPDF): {e}"}), 400, headers)
+
+        page_indices = _parse_pages_param(pages_param, len(doc))
+        all_chains = []
+        for pidx in page_indices:
+            try:
+                page = doc[pidx]
+                chains = _find_dimension_chains(page)
+                for c in chains:
+                    c["page"] = pidx + 1
+                all_chains.extend(chains)
+            except Exception as e:
+                warnings.append(f"Лист {pidx + 1}: ошибка разбора векторной геометрии — {e}")
+
+    return (jsonify({"chains": all_chains, "warnings": warnings}), 200, headers)
+
+
 @functions_framework.http
 def extract_and_verify_tables(request: Request):
     # CORS preflight
@@ -166,6 +310,9 @@ def extract_and_verify_tables(request: Request):
 
     if request.path.rstrip("/").endswith("/gemini-proxy"):
         return _gemini_proxy(request, headers)
+
+    if request.path.rstrip("/").endswith("/vector-geometry"):
+        return _vector_geometry(request, headers)
 
     if "file" not in request.files:
         return (jsonify({"error": "Поле 'file' (PDF) не найдено в запросе"}), 400, headers)
