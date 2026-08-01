@@ -135,7 +135,14 @@ def _gemini_proxy(request: Request, headers: dict):
             url,
             headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
             json=payload["body"],
-            timeout=120,
+            # Раньше здесь стояло 120 секунд — этого хватало, пока запросы были
+            # проще. Теперь Расчёт 4 использует thinkingLevel="high" и в некоторых
+            # случаях несколько изображений в одном запросе (план/разрез/тайлы
+            # проверки) — такой запрос на глубокое рассуждение честно может занять
+            # больше 120 секунд, особенно на moделях линейки Pro. 300 секунд даёт
+            # разумный запас, оставаясь заметно меньше общего таймаута Cloud Run
+            # на сам HTTP-запрос (Request timeout в настройках сервиса — 600с).
+            timeout=300,
         )
     except requests.RequestException as e:
         return (jsonify({"error": {"proxyError": f"Не достучались до Gemini API: {e}"}}), 502, headers)
