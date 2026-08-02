@@ -87,6 +87,9 @@ Google его так и не видел напрямую. Теперь ключ 
     "chains": [
       {"page": 1, "orientation": "row"|"col", "pos_pt": 133.1, "points_pt": [x0, x1, ...], "n_points": 6}
     ],
+    "contour_edges": [
+      {"page": 1, "orientation": "h"|"v", "pos_pt": 910.4, "x0": 312.4, "x1": 1817.5}
+    ],
     "warnings": ["..."]
   }
   points_pt — координаты последовательных засечек вдоль цепочки в pt (1/72 дюйма,
@@ -95,6 +98,15 @@ Google его так и не видел напрямую. Теперь ключ 
   — Y-координаты, все на одном X). Дальнейшая калибровка масштаба (мм за pt) и
   сопоставление с конкретным полем (length_axis_grid_mm и т.п.) — на стороне
   браузера, там уже есть показания Gemini для калибровки.
+
+  contour_edges — прямые отрезки САМОЙ ТОЛСТОЙ линии на листе (по ГОСТ 2.303 это
+  видимый контур объекта, край дна котлована) — кандидаты в стороны прямоугольника
+  котлована. "h" — горизонтальный отрезок (x0/x1 — диапазон по X, pos_pt — общий Y),
+  "v" — вертикальный (аналогично, pos_pt — общий X). Нужны, чтобы сопоставлять
+  цепочку размеров не по близости к (возможно неверному) показанию Gemini, а по
+  тому, реально ли она идёт параллельно и рядом с настоящим краем котлована —
+  структурная проверка, не зависящая от того, ошиблась ли модель в порядке
+  величины.
 
 Функция ничего не сохраняет — тело запроса просто пробрасывается в Gemini вместе
 с серверным ключом, и ответ возвращается как есть (плюс поле error.proxyError
@@ -188,6 +200,38 @@ def _gemini_proxy(request: Request, headers: dict):
     except ValueError:
         body = {"error": {"proxyError": f"Gemini вернула не-JSON (код {upstream.status_code}): {upstream.text[:300]}"}}
     return (jsonify(body), upstream.status_code, headers)
+
+
+def _find_contour_edges(page, min_len=20):
+    """Толстая линия по ГОСТ 2.303 — видимый контур реального объекта (край дна
+    котлована), а не размерная/выносная линия. Берём самую толстую категорию
+    обводки, реально встречающуюся на листе (в разных файлах она разная — где-то
+    0.84pt, где-то другое значение, поэтому вычисляем, а не зашиваем число), и
+    вытаскиваем из неё длинные прямые горизонтальные/вертикальные отрезки —
+    кандидаты в стороны прямоугольного контура котлована."""
+    drawings = page.get_drawings()
+    strokes = [d for d in drawings if d.get("width")]
+    if not strokes:
+        return []
+    max_width = max(d["width"] for d in strokes)
+    thick = [d for d in strokes if d["width"] >= max_width * 0.85]  # тот же "толстый" класс, с запасом на округление
+    edges = []
+    for d in thick:
+        for it in d["items"]:
+            if it[0] != "l":
+                continue
+            p1, p2 = it[1], it[2]
+            dx, dy = p2.x - p1.x, p2.y - p1.y
+            length = math.hypot(dx, dy)
+            if length < min_len:
+                continue
+            if abs(dy) < 1.0 and abs(dx) >= min_len:  # горизонтальный отрезок
+                edges.append({"orientation": "h", "pos_pt": round((p1.y + p2.y) / 2, 1),
+                              "x0": round(min(p1.x, p2.x), 1), "x1": round(max(p1.x, p2.x), 1)})
+            elif abs(dx) < 1.0 and abs(dy) >= min_len:  # вертикальный отрезок
+                edges.append({"orientation": "v", "pos_pt": round((p1.x + p2.x) / 2, 1),
+                              "y0": round(min(p1.y, p2.y), 1), "y1": round(max(p1.y, p2.y), 1)})
+    return edges
 
 
 def _find_ticks(page, min_len=3, max_len=20):
@@ -294,6 +338,7 @@ def _vector_geometry(request: Request, headers: dict):
 
         page_indices = _parse_pages_param(pages_param, len(doc))
         all_chains = []
+        all_edges = []
         for pidx in page_indices:
             try:
                 page = doc[pidx]
@@ -301,10 +346,14 @@ def _vector_geometry(request: Request, headers: dict):
                 for c in chains:
                     c["page"] = pidx + 1
                 all_chains.extend(chains)
+                edges = _find_contour_edges(page)
+                for e in edges:
+                    e["page"] = pidx + 1
+                all_edges.extend(edges)
             except Exception as e:
                 warnings.append(f"Лист {pidx + 1}: ошибка разбора векторной геометрии — {e}")
 
-    return (jsonify({"chains": all_chains, "warnings": warnings}), 200, headers)
+    return (jsonify({"chains": all_chains, "contour_edges": all_edges, "warnings": warnings}), 200, headers)
 
 
 @functions_framework.http
