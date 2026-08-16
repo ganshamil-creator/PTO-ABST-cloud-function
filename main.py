@@ -65,6 +65,19 @@ Google его так и не видел напрямую. Теперь ключ 
   Тело: {"model": "gemini-2.5-flash", "body": {...тело запроса к Gemini как есть...}}
   (поле "apiKey" от клиента больше не требуется — см. "БЕЗОПАСНОСТЬ КЛЮЧА" выше)
 
+Вызов из браузера (OpenAI-прокси, новое):
+  POST <URL функции>/openai-proxy
+  Content-Type: application/json
+  Тело: {"body": {...тело запроса к OpenAI Chat Completions как есть, включая
+         "model", "messages", "response_format" и т.п...}}
+  Требуется переменная окружения OPENAI_API_KEY (тот же принцип, что у
+  GEMINI_API_KEY — ключ только на сервере, клиент его никогда не видит).
+  Второй, независимый от Gemini источник для Расчёта 4 — на реальных тестах
+  на нескольких чертежах GPT в среднем ошибался заметно меньше, чем голая
+  Gemini без нашей защитной обвязки, поэтому его стоит запрашивать параллельно
+  и показывать как отдельную, независимую сверку, а не смешивать с ответом
+  Gemini в одно число.
+
 Вызов из браузера (векторная геометрия размерных цепочек, новое):
   POST <URL функции>/vector-geometry
   Content-Type: multipart/form-data
@@ -138,6 +151,13 @@ GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 # /gemini-proxy отвечает понятной ошибкой 500 вместо непонятного 401 от Gemini.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
+# Второй, независимый источник для Расчёта 4 — GPT (см. сравнение нескольких
+# моделей на реальных чертежах, которое показало, что ни одна модель поодиночке
+# не даёт надёжного результата на этих чертежах, но GPT в среднем ошибался
+# заметно меньше Gemini). Тот же принцип безопасности — ключ только на сервере.
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_API_BASE = "https://api.openai.com/v1/chat/completions"
+
 
 def _cors_headers():
     return {
@@ -202,6 +222,43 @@ def _gemini_proxy(request: Request, headers: dict):
     return (jsonify(body), upstream.status_code, headers)
 
 
+def _openai_proxy(request: Request, headers: dict):
+    if not OPENAI_API_KEY:
+        return (
+            jsonify({"error": {"proxyError": "OPENAI_API_KEY не задан на сервере — добавьте переменную окружения в настройках Cloud Run/Cloud Function и передеплойте"}}),
+            500,
+            headers,
+        )
+
+    try:
+        payload = request.get_json(force=True, silent=False)
+    except Exception:
+        return (jsonify({"error": {"proxyError": "Тело запроса не JSON"}}), 400, headers)
+
+    # Тело запроса ("body") приходит от клиента уже в формате OpenAI Chat
+    # Completions ({"model":..., "messages":[...], "response_format":{...}}) —
+    # сервер просто добавляет свой ключ и пробрасывает как есть, ничего не
+    # интерпретирует, как и /gemini-proxy.
+    if not payload or "body" not in payload:
+        return (jsonify({"error": {"proxyError": "Нужно поле body"}}), 400, headers)
+
+    try:
+        upstream = requests.post(
+            OPENAI_API_BASE,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {OPENAI_API_KEY}"},
+            json=payload["body"],
+            timeout=300,
+        )
+    except requests.RequestException as e:
+        return (jsonify({"error": {"proxyError": f"Не достучались до OpenAI API: {e}"}}), 502, headers)
+
+    try:
+        body = upstream.json()
+    except ValueError:
+        body = {"error": {"proxyError": f"OpenAI вернула не-JSON (код {upstream.status_code}): {upstream.text[:300]}"}}
+    return (jsonify(body), upstream.status_code, headers)
+
+
 def _find_contour_edges(page, min_len=20):
     """Толстая линия по ГОСТ 2.303 — видимый контур реального объекта (край дна
     котлована), а не размерная/выносная линия. Берём самую толстую категорию
@@ -209,6 +266,7 @@ def _find_contour_edges(page, min_len=20):
     0.84pt, где-то другое значение, поэтому вычисляем, а не зашиваем число), и
     вытаскиваем из неё длинные прямые горизонтальные/вертикальные отрезки —
     кандидаты в стороны прямоугольного контура котлована."""
+    rot = page.rotation_matrix  # см. комментарий у _find_ticks — переводим в видимые координаты
     drawings = page.get_drawings()
     strokes = [d for d in drawings if d.get("width")]
     if not strokes:
@@ -220,7 +278,7 @@ def _find_contour_edges(page, min_len=20):
         for it in d["items"]:
             if it[0] != "l":
                 continue
-            p1, p2 = it[1], it[2]
+            p1, p2 = it[1] * rot, it[2] * rot
             dx, dy = p2.x - p1.x, p2.y - p1.y
             length = math.hypot(dx, dy)
             if length < min_len:
@@ -237,7 +295,19 @@ def _find_contour_edges(page, min_len=20):
 def _find_ticks(page, min_len=3, max_len=20):
     """Короткие отрезки под ~45° (катеты примерно равны) — это и есть засечки
     ГОСТ 21.501, которыми в строительных чертежах оканчиваются размерные и
-    выносные линии (в отличие от стрелок в машиностроительных чертежах)."""
+    выносные линии (в отличие от стрелок в машиностроительных чертежах).
+
+    ВАЖНО про поворот страницы: get_drawings() отдаёт координаты в СЫРОМ,
+    неповёрнутом пространстве содержимого PDF (page.mediabox) — а не в том виде,
+    в каком лист реально показывается (page.rect), если у листа выставлен
+    /Rotate (см. page.rotation). У нашего эталонного файла это 270° — то есть
+    без поправки "горизонтальное" и "вертикальное" в сырых координатах не
+    совпадает с тем, что реально видно на отрендеренном листе (в PyMuPDF
+    pixmap(), в pdf.js в браузере, и на том, что видит Gemini). Умножаем каждую
+    точку на page.rotation_matrix, чтобы работать в тех же координатах, что и
+    всё остальное — это и объясняло периодическую путаницу "почему цепочка
+    длины определилась как вертикальная" в более ранних попытках отладки вручную."""
+    rot = page.rotation_matrix
     drawings = page.get_drawings()
     ticks = []
     for d in drawings:
@@ -246,7 +316,7 @@ def _find_ticks(page, min_len=3, max_len=20):
         for it in d["items"]:
             if it[0] != "l":
                 continue
-            p1, p2 = it[1], it[2]
+            p1, p2 = it[1] * rot, it[2] * rot
             dx, dy = p2.x - p1.x, p2.y - p1.y
             length = math.hypot(dx, dy)
             if min_len < length < max_len and abs(dx) > 0.5 and abs(dy) > 0.5:
@@ -366,6 +436,9 @@ def extract_and_verify_tables(request: Request):
 
     if request.path.rstrip("/").endswith("/gemini-proxy"):
         return _gemini_proxy(request, headers)
+
+    if request.path.rstrip("/").endswith("/openai-proxy"):
+        return _openai_proxy(request, headers)
 
     if request.path.rstrip("/").endswith("/vector-geometry"):
         return _vector_geometry(request, headers)
