@@ -3,3 +3,4 @@ flask==3.*
 opendataloader-pdf
 requests==2.*
 pymupdf
+ezdxf>=1.4.0
