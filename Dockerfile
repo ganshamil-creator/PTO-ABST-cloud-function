@@ -13,6 +13,26 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends openjdk-21-jre-headless && \
     rm -rf /var/lib/apt/lists/*
 
+# --- LibreDWG (dwg2dxf) — для эндпоинта /dwg-extract ---
+# Свободная лицензия (GPL), без Autodesk. Собирается из исходников: в
+# стандартных репозиториях Debian готового пакета на момент написания не
+# было. Сборочные инструменты (git/cmake/build-essential) ставятся и сразу
+# же удаляются в этом же слое, чтобы не раздувать финальный образ — остаётся
+# только собранный бинарь dwg2dxf и разделяемая библиотека libredwg.so.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git cmake build-essential pkg-config && \
+    git clone --depth 1 https://github.com/LibreDWG/libredwg.git /tmp/libredwg && \
+    cd /tmp/libredwg && git submodule update --init --recursive && \
+    mkdir build && cd build && \
+    cmake -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release .. && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig && \
+    cd / && rm -rf /tmp/libredwg && \
+    apt-get purge -y git cmake build-essential pkg-config && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

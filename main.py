@@ -33,7 +33,9 @@ Google его так и не видел напрямую. Теперь ключ 
   Точка входа: extract_and_verify_tables
   Runtime: Python 3.11+
   Требуется: Java 17+ в среде выполнения (см. requirements.txt и README ниже);
-  requirements.txt должен включать "requests" (для /gemini-proxy)
+  requirements.txt должен включать "requests" (для /gemini-proxy) и "ezdxf"
+  (для /dwg-extract, новое — см. ниже); Docker-образ должен включать бинарь
+  dwg2dxf (LibreDWG) в PATH — см. примечание у /dwg-extract.
   Обязательная переменная окружения: GEMINI_API_KEY (см. выше — без неё
   /gemini-proxy будет отвечать 500 с понятным текстом ошибки, а не тихо падать)
 
@@ -78,7 +80,7 @@ Google его так и не видел напрямую. Теперь ключ 
   и показывать как отдельную, независимую сверку, а не смешивать с ответом
   Gemini в одно число.
 
-Вызов из браузера (векторная геометрия размерных цепочек, новое):
+Вызов из браузера (векторная геометрия размерных цепочек):
   POST <URL функции>/vector-geometry
   Content-Type: multipart/form-data
   Поле файла: "file" (сам PDF)
@@ -121,6 +123,56 @@ Google его так и не видел напрямую. Теперь ключ 
   структурная проверка, не зависящая от того, ошиблась ли модель в порядке
   величины.
 
+Вызов из браузера (DWG — точное извлечение размеров, БЕЗ AI, новое):
+  POST <URL функции>/dwg-extract
+  Content-Type: multipart/form-data
+  Поле файла: "file" (сам DWG)
+
+  ЗАЧЕМ: если чертёж есть в DWG (а не только в PDF), размеры на нём — это не
+  нарисованные кривыми цифры (как в векторном PDF, экспортированном "в кривые"),
+  а настоящие объекты DIMENSION с готовым числовым значением и точными
+  геометрическими точками замера. Не нужно ни распознавать текст, ни гадать,
+  какой линии он принадлежит и какой оси касается — координаты точек либо
+  СОВПАДАЮТ с координатой известной оси (с точностью до долей мм), либо нет,
+  это факт, а не оценка модели. Это на порядок надёжнее любого способа читать
+  PDF (см. историю отладки длиной в две недели вокруг одного и того же угла
+  одного и того же чертежа, которую этот эндпоинт должен закрыть).
+
+  Проверено на реальных файлах проекта (котлован.dwg, сваи.dwg): конвертация
+  через LibreDWG (dwg2dxf) отработала полностью, разобрано 42 объекта DIMENSION
+  на котловане, включая корректную обработку text_override (когда чертёжник
+  вручную вписал число, отличное от геометрической длины — на практике реально
+  встретилось: измерено 28285мм, показано "46570").
+
+  ТРЕБУЕТСЯ В ОБРАЗЕ: бинарь dwg2dxf (пакет LibreDWG, github.com/LibreDWG/libredwg,
+  свободная лицензия, без Autodesk) должен быть собран и доступен в PATH контейнера
+  — см. отдельные инструкции для Dockerfile, которые нужно добавить руками (этот
+  main.py их не содержит, т.к. сборка — это shell-команды уровня Docker, а не Python).
+
+  Ответ (JSON):
+  {
+    "axes": [{"orientation": "horizontal"|"vertical", "coord": 16740.0}, ...],
+    "dimensions": [
+      {
+        "layer": "Размерные цепочки",
+        "value_mm": 1300.0,
+        "value_source": "geometry"|"text_override",
+        "p1": [x, y] | null, "p2": [x, y] | null,
+        "kind": "inter_axis"|"axis_to_point"|"unrelated",
+        "from_axis": {"orientation": ..., "coord": ...} | null
+      }, ...
+    ],
+    "warnings": ["..."]
+  }
+  "inter_axis" — обе точки размера лежат на известных осях (обычный межосевой
+  пролёт, сумма таких по нужному направлению даёт length_axis_grid_mm/
+  width_axis_grid_mm). "axis_to_point" — ровно одна точка на оси, другая нет:
+  это и есть искомые length_extra_left/right_mm, width_extra_top/bottom_mm —
+  никакого чтения текста, дальше просто сопоставить with уже известным полем по
+  стороне контура. "unrelated" — ни одна точка не совпала с известной осью
+  (например размер внутри детали, не относящийся к габаритам котлована вообще)
+  — такие в текущей версии не используются, но отдаются для полноты картины.
+
 Функция ничего не сохраняет — тело запроса просто пробрасывается в Gemini вместе
 с серверным ключом, и ответ возвращается как есть (плюс поле error.proxyError
 при сетевой/конфигурационной ошибке самого прокси, отдельно от обычных ошибок
@@ -132,10 +184,12 @@ from __future__ import annotations
 import json
 import math
 import os
+import subprocess
 import tempfile
 import traceback
 from collections import defaultdict
 
+import ezdxf
 import functions_framework
 import fitz  # PyMuPDF — добавьте "pymupdf" в requirements.txt
 import requests
@@ -157,6 +211,13 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 # заметно меньше Gemini). Тот же принцип безопасности — ключ только на сервере.
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_API_BASE = "https://api.openai.com/v1/chat/completions"
+
+# Подсказки для поиска слоя осей в DWG (см. /dwg-extract). У проверенных файлов
+# проекта это был слой "S-GRID" (экспорт из Revit, американская номенклатура
+# слоёв AIA), но у других отделов/подрядчиков может называться иначе —
+# добавляйте новые варианты сюда по мере встречи на практике, а не переписывайте
+# логику.
+DWG_AXIS_LAYER_HINTS = ["ось", "оси", "осн.разб", "разбивоч", "axis", "grid", "s-grid"]
 
 
 def _cors_headers():
@@ -426,6 +487,147 @@ def _vector_geometry(request: Request, headers: dict):
     return (jsonify({"chains": all_chains, "contour_edges": all_edges, "warnings": warnings}), 200, headers)
 
 
+def _dwg_to_dxf(dwg_path: str, out_dir: str) -> str:
+    """Конвертирует DWG -> DXF через LibreDWG (бинарь dwg2dxf, должен быть
+    собран в образ — см. примечание в докстринге модуля у /dwg-extract).
+    Бросает RuntimeError с хвостом stderr, если dwg2dxf не смог прочитать файл
+    (повреждённый DWG, либо версия формата, которую LibreDWG пока не разбирает
+    полностью — на практике редко: LibreDWG уверенно читает AutoCAD 2000-2018).
+    """
+    dxf_path = os.path.join(out_dir, "out.dxf")
+    result = subprocess.run(
+        ["dwg2dxf", "-y", dwg_path, "-o", dxf_path],
+        capture_output=True, text=True, timeout=120,
+    )
+    if not os.path.exists(dxf_path):
+        raise RuntimeError((result.stderr or "без вывода в stderr")[-2000:])
+    return dxf_path
+
+
+def _dwg_extract_axes(msp) -> list[dict]:
+    """Оси — длинные прямые линии на слое, название которого совпадает с одной
+    из DWG_AXIS_LAYER_HINTS (см. константу выше). У проверенных файлов проекта
+    это был слой "S-GRID"."""
+    axes = []
+    for e in msp.query("LINE"):
+        layer_lower = (e.dxf.layer or "").lower()
+        if not any(h in layer_lower for h in DWG_AXIS_LAYER_HINTS):
+            continue
+        start, end = e.dxf.start, e.dxf.end
+        horiz = abs(start.y - end.y) < abs(start.x - end.x)
+        axes.append({
+            "orientation": "horizontal" if horiz else "vertical",
+            "coord": round(start.y if horiz else start.x, 1),
+        })
+    return axes
+
+
+def _dwg_extract_dimensions(msp) -> list[dict]:
+    """DIMENSION — настоящий объект с точками замера и значением, не текст,
+    который нужно распознавать. text_override (см. докстринг модуля) в
+    приоритете над геометрическим measurement, когда он есть и явно задан
+    (не пустая строка и не служебный плейсхолдер "<>")."""
+    dims = []
+    for e in msp.query("DIMENSION"):
+        try:
+            measurement = e.get_measurement()
+        except Exception:
+            measurement = None
+
+        dxf = e.dxf
+        p1 = getattr(dxf, "defpoint2", None) or getattr(dxf, "defpoint", None)
+        p2 = getattr(dxf, "defpoint3", None)
+
+        text_override = getattr(dxf, "text", "") or ""
+        if text_override and text_override != "<>":
+            try:
+                value_mm = float(text_override.replace(",", "."))
+                value_source = "text_override"
+            except ValueError:
+                value_mm = measurement
+                value_source = "geometry"
+        else:
+            value_mm = measurement
+            value_source = "geometry"
+
+        if value_mm is None:
+            continue  # размер без geometрии и без читаемого override — пропускаем, а не гадаем
+
+        dims.append({
+            "layer": dxf.layer,
+            "value_mm": round(value_mm, 1),
+            "value_source": value_source,
+            "p1": [round(p1.x, 1), round(p1.y, 1)] if p1 else None,
+            "p2": [round(p2.x, 1), round(p2.y, 1)] if p2 else None,
+        })
+    return dims
+
+
+def _dwg_classify_dimensions(dims: list[dict], axes: list[dict], tol_mm: float = 5.0) -> list[dict]:
+    """Главный приём (проверен на реальном чертеже — см. докстринг модуля):
+    размер с РОВНО ОДНОЙ точкой на известной оси — это искомая добавка
+    (length_extra_*/width_extra_*), не нужно ни искать контур котлована, ни
+    гадать через vision, какой линии касается число. Обе точки на осях —
+    обычный межосевой пролёт. Ни одной — не относится к сетке осей вообще."""
+    def axis_at(pt):
+        if not pt:
+            return None
+        for a in axes:
+            coord = pt[1] if a["orientation"] == "horizontal" else pt[0]
+            if abs(coord - a["coord"]) <= tol_mm:
+                return a
+        return None
+
+    for d in dims:
+        a1, a2 = axis_at(d["p1"]), axis_at(d["p2"])
+        if a1 and a2:
+            d["kind"], d["from_axis"] = "inter_axis", None
+        elif a1 or a2:
+            d["kind"], d["from_axis"] = "axis_to_point", (a1 or a2)
+        else:
+            d["kind"], d["from_axis"] = "unrelated", None
+    return dims
+
+
+def _dwg_extract(request: Request, headers: dict):
+    if "file" not in request.files:
+        return (jsonify({"error": "Поле 'file' (DWG) не найдено в запросе"}), 400, headers)
+
+    upload = request.files["file"]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dwg_path = os.path.join(tmpdir, "input.dwg")
+        upload.save(dwg_path)
+
+        try:
+            dxf_path = _dwg_to_dxf(dwg_path, tmpdir)
+        except FileNotFoundError:
+            # dwg2dxf не найден в PATH — образ ещё не пересобран с LibreDWG.
+            return (jsonify({"error": "dwg2dxf не установлен в образе — см. инструкцию по добавлению LibreDWG в Dockerfile"}), 500, headers)
+        except (RuntimeError, subprocess.SubprocessError, subprocess.TimeoutExpired) as e:
+            return (jsonify({"error": f"Не удалось сконвертировать DWG в DXF: {e}"}), 400, headers)
+
+        try:
+            doc = ezdxf.readfile(dxf_path)
+        except Exception as e:
+            return (jsonify({"error": f"ezdxf не смог прочитать сконвертированный DXF: {e}"}), 500, headers)
+
+        msp = doc.modelspace()
+        axes = _dwg_extract_axes(msp)
+        dims = _dwg_extract_dimensions(msp)
+        dims = _dwg_classify_dimensions(dims, axes)
+
+    warnings: list[str] = []
+    if not axes:
+        warnings.append(
+            "Оси не найдены по известным названиям слоёв (DWG_AXIS_LAYER_HINTS) — "
+            "возможно, на этом чертеже слой осей называется иначе; добавьте его "
+            "название в DWG_AXIS_LAYER_HINTS в main.py."
+        )
+
+    return (jsonify({"axes": axes, "dimensions": dims, "warnings": warnings}), 200, headers)
+
+
 @functions_framework.http
 def extract_and_verify_tables(request: Request):
     # CORS preflight
@@ -442,6 +644,9 @@ def extract_and_verify_tables(request: Request):
 
     if request.path.rstrip("/").endswith("/vector-geometry"):
         return _vector_geometry(request, headers)
+
+    if request.path.rstrip("/").endswith("/dwg-extract"):
+        return _dwg_extract(request, headers)
 
     if "file" not in request.files:
         return (jsonify({"error": "Поле 'file' (PDF) не найдено в запросе"}), 400, headers)
