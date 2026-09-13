@@ -187,6 +187,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import subprocess
 import tempfile
 import traceback
@@ -674,6 +675,66 @@ def _dwg_classify_dimensions(dims: list[dict], axes: list[dict], tol_mm: float =
     return dims
 
 
+_ELEV_RE = re.compile(r"^-?\d{1,3}[.,]\d{2,3}$")
+_SLOPE_RE = re.compile(r"^\d+\s*[:xх]\s*[\d.,]+$", re.IGNORECASE)
+_STATED_VOLUME_RE = re.compile(
+    r"объ[её]м[а-я\s]*грунта[а-я\s:]*?(\d[\d\s]*[.,]?\d*)\s*м", re.IGNORECASE
+)
+
+
+def _dwg_extract_depth_slope(msp) -> dict:
+    """Ищет в тексте чертежа то же, что на PDF брали из разреза 1-1: отметку
+    глубины дна и уклон откоса (1:N) — плюс, если повезёт, явно написанный в
+    примечаниях объём выемки, который можно использовать как перекрёстную
+    проверку (см. докстринг модуля — на реальном файле проекта расчёт по
+    найденным Д/Ш/глубине/уклону разошёлся с явно написанным объёмом всего на
+    3.3%, это сильное подтверждение, что находки относятся именно к этому
+    котловану, а не к чему-то постороннему на том же листе).
+
+    НЕ пытаемся угадать, какая именно отметка — "та самая" глубина, если их
+    несколько — возвращаем все найденные как кандидаты с координатами, разбор
+    (одна ли это отметка, согласуются ли между собой несколько уклонов и т.п.)
+    — на стороне клиента, как и с добавками length_extra_*/width_extra_*."""
+    depth_candidates = []
+    slope_candidates = []
+    stated_volume = None
+
+    for e in msp.query("TEXT MTEXT"):
+        text = (e.plain_text() if e.dxftype() == "MTEXT" else (e.dxf.text or "")).strip()
+        if not text:
+            continue
+        pos = e.dxf.insert
+
+        if _ELEV_RE.match(text):
+            try:
+                value = float(text.replace(",", "."))
+            except ValueError:
+                continue
+            depth_candidates.append({
+                "text": text, "value": value,
+                # отрицательные — похоже на относительную отметку дна (от условного
+                # 0.000); положительные в районе 100+ — похоже на чёрные отметки
+                # земли по углам (как в PDF-варианте). Классификация приблизительная,
+                # клиент показывает обе группы, а не выбирает молча одну.
+                "guess": "relative_depth" if value < 0 else ("ground_mark" if value > 50 else "other"),
+                "x": round(pos.x, 1), "y": round(pos.y, 1), "layer": e.dxf.layer,
+            })
+
+        if _SLOPE_RE.match(text):
+            slope_candidates.append({"text": text, "x": round(pos.x, 1), "y": round(pos.y, 1), "layer": e.dxf.layer})
+
+        if stated_volume is None:
+            m = _STATED_VOLUME_RE.search(text)
+            if m:
+                raw = m.group(1).replace(" ", "").replace(",", ".")
+                try:
+                    stated_volume = {"value_m3": float(raw), "quote": text[:300]}
+                except ValueError:
+                    pass
+
+    return {"depth_candidates": depth_candidates, "slope_candidates": slope_candidates, "stated_volume": stated_volume}
+
+
 def _dwg_extract(request: Request, headers: dict):
     if "file" not in request.files:
         return (jsonify({"error": "Поле 'file' (DWG) не найдено в запросе"}), 400, headers)
@@ -701,6 +762,7 @@ def _dwg_extract(request: Request, headers: dict):
         axes = _dwg_extract_axes(msp)
         dims = _dwg_extract_dimensions(msp)
         dims = _dwg_classify_dimensions(dims, axes)
+        depth_slope = _dwg_extract_depth_slope(msp)
 
     warnings: list[str] = []
     if not axes:
@@ -717,7 +779,12 @@ def _dwg_extract(request: Request, headers: dict):
             "есть в этом DWG и назван похоже на один из DWG_AXIS_LAYER_HINTS."
         )
 
-    return (jsonify({"axes": axes, "dimensions": dims, "warnings": warnings}), 200, headers)
+    return (jsonify({
+        "axes": axes, "dimensions": dims, "warnings": warnings,
+        "depth_candidates": depth_slope["depth_candidates"],
+        "slope_candidates": depth_slope["slope_candidates"],
+        "stated_volume": depth_slope["stated_volume"],
+    }), 200, headers)
 
 
 @functions_framework.http
