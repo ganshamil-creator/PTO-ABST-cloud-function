@@ -142,7 +142,10 @@ Google его так и не видел напрямую. Теперь ключ 
   через LibreDWG (dwg2dxf) отработала полностью, разобрано 42 объекта DIMENSION
   на котловане, включая корректную обработку text_override (когда чертёжник
   вручную вписал число, отличное от геометрической длины — на практике реально
-  встретилось: измерено 28285мм, показано "46570").
+  встретилось: измерено 28285мм, показано "46570"). Оси дополнительно размечены
+  по подписи на самом чертеже как "numbered" (цифровые 1,2,3...) или "lettered"
+  (буквенные А,Б,В...) — по ГОСТ это и есть надёжный признак, какое направление
+  длина, а какое ширина, вместо догадки по сырой ориентации в координатах DWG.
 
   ТРЕБУЕТСЯ В ОБРАЗЕ: бинарь dwg2dxf (пакет LibreDWG, github.com/LibreDWG/libredwg,
   свободная лицензия, без Autodesk) должен быть собран и доступен в PATH контейнера
@@ -151,7 +154,7 @@ Google его так и не видел напрямую. Теперь ключ 
 
   Ответ (JSON):
   {
-    "axes": [{"orientation": "horizontal"|"vertical", "coord": 16740.0}, ...],
+    "axes": [{"orientation": "horizontal"|"vertical", "coord": 16740.0, "label": "Д"|null, "axis_type": "numbered"|"lettered"|null}, ...],
     "dimensions": [
       {
         "layer": "Размерные цепочки",
@@ -504,10 +507,33 @@ def _dwg_to_dxf(dwg_path: str, out_dir: str) -> str:
     return dxf_path
 
 
+def _dwg_axis_label_kind(label: str) -> str | None:
+    """По ГОСТ цифровые оси (1, 2, 3...) идут в одном направлении (обычно
+    длина здания), буквенные (А, Б, В...) — в перпендикулярном (обычно
+    ширина). Подтверждено на реальном файле проекта: 1-18 вертикальные в
+    координатах DWG, А-Ж горизонтальные. Само по себе это не говорит, что
+    "цифровые = length_axis_grid_mm" универсально для абсолютно любого
+    чертежа (возможна и обратная ориентация листа), но даёт однозначный,
+    проверяемый признак — гораздо надёжнее, чем полагаться на то, какая
+    ориентация в сырых DWG-координатах горизонтальная, а какая вертикальная."""
+    clean = label.strip().rstrip("*").strip()
+    if not clean:
+        return None
+    if clean.isdigit():
+        return "numbered"
+    if len(clean) <= 2 and clean.isalpha():
+        return "lettered"
+    return None
+
+
 def _dwg_extract_axes(msp) -> list[dict]:
     """Оси — длинные прямые линии на слое, название которого совпадает с одной
     из DWG_AXIS_LAYER_HINTS (см. константу выше). У проверенных файлов проекта
-    это был слой "S-GRID"."""
+    это был слой "S-GRID". Дополнительно ищем подписи осей (MTEXT на том же
+    или соседнем "-IDEN" слое, например "S-GRID-IDEN") и сопоставляем их с
+    линией оси по совпадению координаты — это даёт "numbered"/"lettered" для
+    каждой оси, чтобы клиент мог надёжно понять, какое направление — длина,
+    а какое — ширина, не полагаясь на сырую ориентацию в координатах DWG."""
     axes = []
     for e in msp.query("LINE"):
         layer_lower = (e.dxf.layer or "").lower()
@@ -518,7 +544,66 @@ def _dwg_extract_axes(msp) -> list[dict]:
         axes.append({
             "orientation": "horizontal" if horiz else "vertical",
             "coord": round(start.y if horiz else start.x, 1),
+            "label": None,
+            "axis_type": None,
         })
+
+    # Подписи осей — обычно MTEXT (реже TEXT), очищаем инлайн-форматирование
+    # через plain_text(), чтобы из '\fISOCPEUR|...;1' получить просто '1'.
+    labels = []
+    for e in msp.query("MTEXT"):
+        layer_lower = (e.dxf.layer or "").lower()
+        if not any(h in layer_lower for h in DWG_AXIS_LAYER_HINTS):
+            continue
+        text = e.plain_text().strip()
+        if text:
+            labels.append((text, e.dxf.insert.x, e.dxf.insert.y))
+    for e in msp.query("TEXT"):
+        layer_lower = (e.dxf.layer or "").lower()
+        if not any(h in layer_lower for h in DWG_AXIS_LAYER_HINTS):
+            continue
+        text = (e.dxf.text or "").strip()
+        if text:
+            labels.append((text, e.dxf.insert.x, e.dxf.insert.y))
+
+    # Подпись стоит не точно на линии оси, а со смещением (кружок с буквой/
+    # цифрой вынесен за пределы листа) — на практике смещение варьируется от
+    # ~90 до ~165мм в зависимости от чертежа. Вместо жёсткого допуска берём
+    # БЛИЖАЙШУЮ ось по перпендикулярной координате — это устойчиво, пока
+    # подпись ближе к своей оси, чем к соседней (то есть смещение меньше
+    # половины минимального шага сетки — на практике так и есть).
+    for text, lx, ly in labels:
+        kind = _dwg_axis_label_kind(text)
+        if kind is None:
+            continue
+        best, best_dist = None, None
+        for a in axes:
+            coord = ly if a["orientation"] == "horizontal" else lx
+            dist = abs(coord - a["coord"])
+            if best_dist is None or dist < best_dist:
+                best, best_dist = a, dist
+        if best is not None and best["label"] is None:
+            best["label"] = text.rstrip("*").strip()
+            best["axis_type"] = kind
+
+    # Проверка на согласованность (реально понадобилась на практике): если
+    # для целой ориентации подавляющее большинство осей получили один и тот
+    # же axis_type ("numbered" или "lettered"), а конкретная ось — другой,
+    # это почти наверняка не её собственная подпись, а случайно ближайшая
+    # подпись от постороннего элемента листа (например узла/детали в другом
+    # месте чертежа). Сбрасываем такие — лучше честный null, чем неверный тип.
+    for orientation in ("horizontal", "vertical"):
+        group = [a for a in axes if a["orientation"] == orientation and a["axis_type"]]
+        if len(group) < 3:
+            continue
+        counts = {"numbered": 0, "lettered": 0}
+        for a in group:
+            counts[a["axis_type"]] += 1
+        dominant = "numbered" if counts["numbered"] >= counts["lettered"] else "lettered"
+        for a in group:
+            if a["axis_type"] != dominant:
+                a["label"], a["axis_type"] = None, None
+
     return axes
 
 
@@ -623,6 +708,13 @@ def _dwg_extract(request: Request, headers: dict):
             "Оси не найдены по известным названиям слоёв (DWG_AXIS_LAYER_HINTS) — "
             "возможно, на этом чертеже слой осей называется иначе; добавьте его "
             "название в DWG_AXIS_LAYER_HINTS в main.py."
+        )
+    elif not any(a["axis_type"] for a in axes):
+        warnings.append(
+            "Ни одна ось не получила подпись numbered/lettered — сопоставление "
+            "длины/ширины ниже может быть ненадёжным. Проверьте, что слой с "
+            "подписями осей (обычно *-IDEN, например S-GRID-IDEN) действительно "
+            "есть в этом DWG и назван похоже на один из DWG_AXIS_LAYER_HINTS."
         )
 
     return (jsonify({"axes": axes, "dimensions": dims, "warnings": warnings}), 200, headers)
