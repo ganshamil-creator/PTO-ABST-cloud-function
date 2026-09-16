@@ -735,6 +735,87 @@ def _dwg_extract_depth_slope(msp) -> dict:
     return {"depth_candidates": depth_candidates, "slope_candidates": slope_candidates, "stated_volume": stated_volume}
 
 
+_PILE_NUM_RE = re.compile(r"^\d+$")
+# ГОСТ 19804-91: С<длина в дм>-<сечение в см>-<номер армирования>, например "С100-35-10"
+# означает длину 10.0 м (100 дм), квадратное сечение 350х350 мм (35 см).
+_PILE_MARK_RE = re.compile(r"^С\s?(\d+)[.\-](\d+)[.\-](\d+)", re.IGNORECASE)
+_PILE_RANGE_RE = re.compile(r"^(\d+)\s*-\s*(\d+)$")
+_CUT_ELEV_RE = re.compile(r"на\s+отм\.?\s*(-?[\d.,]+)", re.IGNORECASE)
+_DATUM_RE = re.compile(r"абсолютной\s+отметке\s+([\d.,]+)", re.IGNORECASE)
+
+
+def _dwg_extract_piles(msp) -> dict:
+    """Считает сваи по номерным текстовым подписям на плане свайного поля (не
+    по точкам/блокам — проверено на реальном файле проекта: сами сваи никак
+    не обозначены отдельными блоками, только номер рядом с каждой) и находит
+    марку сваи в примечаниях/спецификации, чтобы по ГОСТ 19804-91 определить
+    длину и сечение — дальше количество × объём одной сваи = общий объём.
+
+    НЕ пытается сама решить, какие числовые подписи на листе — номера свай, а
+    какие — что-то другое (координаты, отметки и т.п.): считает ВСЕ чисто
+    числовые подписи, а разбор на стороне клиента (обычно диапазон 1..N без
+    пропусков — довольно характерный, легко отличимый паттерн от случайных
+    чисел на чертеже)."""
+    numbers = []
+    marks = {}
+    ranges = []
+    cut_elev = None
+    datum_abs = None
+    test_piles_note = None
+
+    for e in msp.query("TEXT MTEXT"):
+        text = (e.plain_text() if e.dxftype() == "MTEXT" else (e.dxf.text or "")).strip()
+        if not text:
+            continue
+
+        if _PILE_NUM_RE.match(text):
+            numbers.append(int(text))
+
+        m = _PILE_MARK_RE.match(text)
+        if m:
+            length_dm, section_cm = int(m.group(1)), int(m.group(2))
+            marks[(length_dm, section_cm)] = {
+                "text": text, "length_m": length_dm / 10, "section_m": section_cm / 100,
+            }
+
+        if _PILE_RANGE_RE.match(text):
+            ranges.append(text)
+
+        m3 = _CUT_ELEV_RE.search(text)
+        if m3 and cut_elev is None:
+            try:
+                cut_elev = float(m3.group(1).replace(",", "."))
+            except ValueError:
+                pass
+
+        m4 = _DATUM_RE.search(text)
+        if m4 and datum_abs is None:
+            try:
+                datum_abs = float(m4.group(1).replace(",", "."))
+            except ValueError:
+                pass
+
+        low = text.lower()
+        if test_piles_note is None and "пробн" in low and "сва" in low:
+            test_piles_note = text
+
+    unique_numbers = sorted(set(numbers))
+    has_gaps = None
+    if unique_numbers:
+        has_gaps = unique_numbers != list(range(unique_numbers[0], unique_numbers[-1] + 1))
+
+    return {
+        "count": len(unique_numbers),
+        "number_range": [unique_numbers[0], unique_numbers[-1]] if unique_numbers else None,
+        "has_gaps": has_gaps,
+        "marks": list(marks.values()),
+        "spec_ranges": ranges,
+        "cut_elevation": cut_elev,
+        "datum_absolute": datum_abs,
+        "test_piles_note": test_piles_note,
+    }
+
+
 def _dwg_extract(request: Request, headers: dict):
     if "file" not in request.files:
         return (jsonify({"error": "Поле 'file' (DWG) не найдено в запросе"}), 400, headers)
@@ -763,6 +844,7 @@ def _dwg_extract(request: Request, headers: dict):
         dims = _dwg_extract_dimensions(msp)
         dims = _dwg_classify_dimensions(dims, axes)
         depth_slope = _dwg_extract_depth_slope(msp)
+        piles = _dwg_extract_piles(msp)
 
     warnings: list[str] = []
     if not axes:
@@ -784,6 +866,7 @@ def _dwg_extract(request: Request, headers: dict):
         "depth_candidates": depth_slope["depth_candidates"],
         "slope_candidates": depth_slope["slope_candidates"],
         "stated_volume": depth_slope["stated_volume"],
+        "piles": piles,
     }), 200, headers)
 
 
