@@ -185,6 +185,7 @@ Gemini API).
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -198,6 +199,13 @@ import functions_framework
 import fitz  # PyMuPDF — добавьте "pymupdf" в requirements.txt
 import requests
 from flask import Request, jsonify
+
+logger = logging.getLogger("pto-cloud")
+
+# Лимиты на вход (пакет 1 по ревью). Подберите под ваш Cloud Run (по умолчанию
+# 512 МиБ памяти; временные файлы тоже лежат в памяти).
+MAX_UPLOAD_BYTES = 60 * 1024 * 1024   # 60 МБ на файл
+MAX_PAGES_PER_REQUEST = 40            # листов PDF за один запрос
 
 import opendataloader_pdf
 from verify_table import verify_table, _grid, estimate_volume_from_mass  # тот же модуль, что и в takeoff_pipeline.py
@@ -333,17 +341,28 @@ def _find_contour_edges(page, min_len=20):
     кандидаты в стороны прямоугольного контура котлована."""
     rot = page.rotation_matrix  # см. комментарий у _find_ticks — переводим в видимые координаты
     drawings = page.get_drawings()
-    strokes = [d for d in drawings if d.get("width")]
+    # Линии с нулевой/отсутствующей толщиной (частый случай в CAD-экспортах)
+    # не отбрасываем целиком: считаем их толщиной 0.
+    strokes = [d for d in drawings if d.get("items")]
     if not strokes:
         return []
-    max_width = max(d["width"] for d in strokes)
-    thick = [d for d in strokes if d["width"] >= max_width * 0.85]  # тот же "толстый" класс, с запасом на округление
+    for d in strokes:
+        d["_w"] = d.get("width") or 0.0
+    max_width = max(d["_w"] for d in strokes)
+    thick = [d for d in strokes if d["_w"] >= max_width * 0.85]  # тот же "толстый" класс, с запасом на округление
     edges = []
     for d in thick:
+        segs = []
         for it in d["items"]:
-            if it[0] != "l":
-                continue
-            p1, p2 = it[1] * rot, it[2] * rot
+            if it[0] == "l":
+                segs.append((it[1] * rot, it[2] * rot))
+            elif it[0] == "re":
+                # прямоугольник, записанный одной операцией, — 4 стороны
+                r = it[1]
+                c = [fitz.Point(r.x0, r.y0) * rot, fitz.Point(r.x1, r.y0) * rot,
+                     fitz.Point(r.x1, r.y1) * rot, fitz.Point(r.x0, r.y1) * rot]
+                segs.extend((c[i], c[(i + 1) % 4]) for i in range(4))
+        for p1, p2 in segs:
             dx, dy = p2.x - p1.x, p2.y - p1.y
             length = math.hypot(dx, dy)
             if length < min_len:
@@ -354,6 +373,9 @@ def _find_contour_edges(page, min_len=20):
             elif abs(dx) < 1.0 and abs(dy) >= min_len:  # вертикальный отрезок
                 edges.append({"orientation": "v", "pos_pt": round((p1.x + p2.x) / 2, 1),
                               "y0": round(min(p1.y, p2.y), 1), "y1": round(max(p1.y, p2.y), 1)})
+    if len(edges) > 400:  # защита от лавины рёбер, если толщины у линий нет вовсе
+        edges.sort(key=lambda e: -((e.get("x1", 0) - e.get("x0", 0)) + (e.get("y1", 0) - e.get("y0", 0))))
+        edges = edges[:400]
     return edges
 
 
@@ -376,8 +398,6 @@ def _find_ticks(page, min_len=3, max_len=20):
     drawings = page.get_drawings()
     ticks = []
     for d in drawings:
-        if not d.get("width"):
-            continue
         for it in d["items"]:
             if it[0] != "l":
                 continue
@@ -427,7 +447,7 @@ def _find_dimension_chains(page):
     и сопоставление с конкретными полями делается на клиенте, где уже есть
     показания Gemini для калибровки — сервер отдаёт только сырую геометрию."""
     ticks = _find_ticks(page)
-    if len(ticks) < 8:
+    if len(ticks) < 2:  # меньше двух засечек цепочки не бывает; шум отсекает клиент (n_points)
         return []
     rows = _cluster_1d(ticks, key_idx=1)  # группируем по Y -> горизонтальные цепочки
     cols = _cluster_1d(ticks, key_idx=0)  # группируем по X -> вертикальные цепочки
@@ -440,19 +460,48 @@ def _find_dimension_chains(page):
 
 
 def _parse_pages_param(pages_str, page_count, default_max=3):
+    """Разбирает "1,3,5-7" без разворачивания больших диапазонов в список:
+    границы обрезаются по page_count ДО range(). Бросает ValueError с понятным
+    текстом на мусорный ввод. Не больше MAX_PAGES_PER_REQUEST листов."""
     if not pages_str:
         return list(range(min(page_count, default_max)))
-    result = []
-    for part in pages_str.split(","):
+    result: list[int] = []
+    seen = set()
+    for part in str(pages_str).split(","):
         part = part.strip()
         if not part:
             continue
-        if "-" in part:
-            a, b = part.split("-")
-            result.extend(range(int(a) - 1, int(b)))
-        else:
-            result.append(int(part) - 1)
-    return [p for p in result if 0 <= p < page_count]
+        try:
+            if "-" in part:
+                a_s, b_s = part.split("-", 1)
+                a, b = int(a_s), int(b_s)
+            else:
+                a = b = int(part)
+        except ValueError:
+            raise ValueError(f"Некорректный номер/диапазон страниц: {part!r}")
+        if a < 1 or b < 1 or b < a:
+            raise ValueError(f"Некорректный диапазон страниц: {part!r}")
+        a, b = a, min(b, page_count)           # обрезаем ДО range()
+        for p in range(a - 1, b):
+            if p not in seen:
+                seen.add(p)
+                result.append(p)
+            if len(result) > MAX_PAGES_PER_REQUEST:
+                raise ValueError(f"Слишком много страниц за один запрос (максимум {MAX_PAGES_PER_REQUEST})")
+    return result
+
+
+def _check_upload_size(upload):
+    """None, если размер допустим; иначе текст ошибки."""
+    try:
+        upload.stream.seek(0, os.SEEK_END)
+        size = upload.stream.tell()
+        upload.stream.seek(0)
+    except Exception:
+        return None
+    if size > MAX_UPLOAD_BYTES:
+        return f"Файл слишком большой: {size // (1024 * 1024)} МБ (максимум {MAX_UPLOAD_BYTES // (1024 * 1024)} МБ)"
+    return None
 
 
 def _vector_geometry(request: Request, headers: dict):
@@ -460,6 +509,9 @@ def _vector_geometry(request: Request, headers: dict):
         return (jsonify({"error": "Поле 'file' (PDF) не найдено в запросе"}), 400, headers)
 
     upload = request.files["file"]
+    size_err = _check_upload_size(upload)
+    if size_err:
+        return (jsonify({"error": size_err}), 413, headers)
     pages_param = request.form.get("pages", "")
     warnings: list[str] = []
 
@@ -471,7 +523,10 @@ def _vector_geometry(request: Request, headers: dict):
         except Exception as e:
             return (jsonify({"error": f"Не удалось открыть PDF (PyMuPDF): {e}"}), 400, headers)
 
-        page_indices = _parse_pages_param(pages_param, len(doc))
+        try:
+            page_indices = _parse_pages_param(pages_param, len(doc))
+        except ValueError as e:
+            return (jsonify({"error": str(e)}), 400, headers)
         all_chains = []
         all_edges = []
         for pidx in page_indices:
@@ -488,24 +543,53 @@ def _vector_geometry(request: Request, headers: dict):
             except Exception as e:
                 warnings.append(f"Лист {pidx + 1}: ошибка разбора векторной геометрии — {e}")
 
+    if page_indices and not all_chains:
+        warnings.append("Векторные размерные цепочки не найдены — вероятно, скан или чертёж без векторных засечек; опирайтесь на распознавание и ручной ввод.")
     return (jsonify({"chains": all_chains, "contour_edges": all_edges, "warnings": warnings}), 200, headers)
 
 
-def _dwg_to_dxf(dwg_path: str, out_dir: str) -> str:
+def _dwg_to_dxf(dwg_path: str, out_dir: str):
     """Конвертирует DWG -> DXF через LibreDWG (бинарь dwg2dxf, должен быть
     собран в образ — см. примечание в докстринге модуля у /dwg-extract).
-    Бросает RuntimeError с хвостом stderr, если dwg2dxf не смог прочитать файл
-    (повреждённый DWG, либо версия формата, которую LibreDWG пока не разбирает
-    полностью — на практике редко: LibreDWG уверенно читает AutoCAD 2000-2018).
-    """
+    Возвращает (путь_к_dxf, предупреждения). Код возврата проверяется:
+    >= 128 — критическая ошибка (RuntimeError), 1..127 — файл создан, но
+    LibreDWG сообщил о проблемах (часть объектов могла потеряться) —
+    возвращаем это в предупреждениях, а не объявляем результат полным."""
     dxf_path = os.path.join(out_dir, "out.dxf")
     result = subprocess.run(
         ["dwg2dxf", "-y", dwg_path, "-o", dxf_path],
         capture_output=True, text=True, timeout=120,
     )
-    if not os.path.exists(dxf_path):
-        raise RuntimeError((result.stderr or "без вывода в stderr")[-2000:])
-    return dxf_path
+    stderr_tail = (result.stderr or "")[-2000:]
+    if result.returncode >= 128 or not os.path.exists(dxf_path):
+        raise RuntimeError(f"dwg2dxf код {result.returncode}: {stderr_tail or 'без вывода в stderr'}")
+    warns = []
+    if result.returncode != 0:
+        logger.warning("dwg2dxf вернул код %s: %s", result.returncode, stderr_tail)
+        warns.append(
+            f"Конвертер DWG→DXF завершился с кодом {result.returncode}: часть объектов могла не "
+            "прочитаться. Результат может быть неполным — перепроверьте размеры/сваи вручную."
+        )
+    return dxf_path, warns
+
+
+# $INSUNITS (AutoCAD) -> миллиметров в одной единице чертежа
+_INSUNITS_TO_MM = {
+    1: 25.4, 2: 304.8, 3: 1609344.0, 4: 1.0, 5: 10.0, 6: 1000.0, 7: 1_000_000.0,
+    8: 0.0000254, 9: 0.0254, 10: 914.4, 14: 100.0, 15: 10_000.0, 16: 100_000.0,
+}
+
+
+def _dwg_units_scale(doc) -> tuple[float, dict]:
+    """(мм на единицу чертежа, описание). INSUNITS=0 (не задано) трактуем как
+    мм, как раньше, но явно отмечаем это допущение в ответе."""
+    try:
+        code = int(doc.header.get("$INSUNITS", 0) or 0)
+    except Exception:
+        code = 0
+    if code in _INSUNITS_TO_MM:
+        return _INSUNITS_TO_MM[code], {"insunits": code, "scale_to_mm": _INSUNITS_TO_MM[code], "assumed": False}
+    return 1.0, {"insunits": code, "scale_to_mm": 1.0, "assumed": True}
 
 
 def _dwg_axis_label_kind(label: str) -> str | None:
@@ -527,7 +611,7 @@ def _dwg_axis_label_kind(label: str) -> str | None:
     return None
 
 
-def _dwg_extract_axes(msp) -> list[dict]:
+def _dwg_extract_axes(msp, k: float = 1.0, notes: list | None = None) -> list[dict]:
     """Оси — длинные прямые линии на слое, название которого совпадает с одной
     из DWG_AXIS_LAYER_HINTS (см. константу выше). У проверенных файлов проекта
     это был слой "S-GRID". Дополнительно ищем подписи осей (MTEXT на том же
@@ -536,18 +620,29 @@ def _dwg_extract_axes(msp) -> list[dict]:
     каждой оси, чтобы клиент мог надёжно понять, какое направление — длина,
     а какое — ширина, не полагаясь на сырую ориентацию в координатах DWG."""
     axes = []
+    skipped_diag = 0
     for e in msp.query("LINE"):
         layer_lower = (e.dxf.layer or "").lower()
         if not any(h in layer_lower for h in DWG_AXIS_LAYER_HINTS):
             continue
         start, end = e.dxf.start, e.dxf.end
-        horiz = abs(start.y - end.y) < abs(start.x - end.x)
+        dx, dy = abs(end.x - start.x), abs(end.y - start.y)
+        if min(dx, dy) > 0.02 * max(dx, dy, 1e-9):
+            # линия не параллельна осям координат (диагональ / повёрнутая
+            # сетка) — не записываем её как горизонтальную/вертикальную
+            skipped_diag += 1
+            continue
+        horiz = dy < dx
         axes.append({
             "orientation": "horizontal" if horiz else "vertical",
-            "coord": round(start.y if horiz else start.x, 1),
+            "coord": round((start.y if horiz else start.x) * k, 1),
             "label": None,
             "axis_type": None,
         })
+
+    if skipped_diag and notes is not None:
+        notes.append(f"Пропущено линий слоя осей, не параллельных осям координат: {skipped_diag} "
+                     "(повёрнутая сетка не поддерживается — проверьте результат).")
 
     # Подписи осей — обычно MTEXT (реже TEXT), очищаем инлайн-форматирование
     # через plain_text(), чтобы из '\fISOCPEUR|...;1' получить просто '1'.
@@ -558,14 +653,14 @@ def _dwg_extract_axes(msp) -> list[dict]:
             continue
         text = e.plain_text().strip()
         if text:
-            labels.append((text, e.dxf.insert.x, e.dxf.insert.y))
+            labels.append((text, e.dxf.insert.x * k, e.dxf.insert.y * k))
     for e in msp.query("TEXT"):
         layer_lower = (e.dxf.layer or "").lower()
         if not any(h in layer_lower for h in DWG_AXIS_LAYER_HINTS):
             continue
         text = (e.dxf.text or "").strip()
         if text:
-            labels.append((text, e.dxf.insert.x, e.dxf.insert.y))
+            labels.append((text, e.dxf.insert.x * k, e.dxf.insert.y * k))
 
     # Подпись стоит не точно на линии оси, а со смещением (кружок с буквой/
     # цифрой вынесен за пределы листа) — на практике смещение варьируется от
@@ -608,44 +703,79 @@ def _dwg_extract_axes(msp) -> list[dict]:
     return axes
 
 
-def _dwg_extract_dimensions(msp) -> list[dict]:
+def _dwg_extract_dimensions(msp, k: float = 1.0, notes: list | None = None) -> list[dict]:
     """DIMENSION — настоящий объект с точками замера и значением, не текст,
-    который нужно распознавать. text_override (см. докстринг модуля) в
-    приоритете над геометрическим measurement, когда он есть и явно задан
-    (не пустая строка и не служебный плейсхолдер "<>")."""
+    который нужно распознавать. Геометрическое значение ВСЕГДА сохраняется
+    (geometry_mm); text_override (когда он явно задан и не "<>") имеет
+    приоритет в value_mm, как и раньше, но расхождение с геометрией больше
+    1% помечается conflict=True, чтобы инженер видел его, а не получал
+    молча выбранное число. Только линейные размеры (linear/aligned/rotated):
+    угловые, радиальные и диаметральные не имеют смысла как «мм».
+    k — мм на единицу чертежа ($INSUNITS)."""
     dims = []
+    skipped_types = 0
     for e in msp.query("DIMENSION"):
+        dxf = e.dxf
+        try:
+            dimtype = int(getattr(dxf, "dimtype", 0)) & 0x0F
+        except Exception:
+            dimtype = 0
+        if dimtype not in (0, 1):  # 0 = linear/rotated, 1 = aligned
+            skipped_types += 1
+            continue
+
         try:
             measurement = e.get_measurement()
         except Exception:
             measurement = None
+        if measurement is not None:
+            try:
+                measurement = float(measurement) * k
+            except (TypeError, ValueError):
+                measurement = None
 
-        dxf = e.dxf
-        p1 = getattr(dxf, "defpoint2", None) or getattr(dxf, "defpoint", None)
-        p2 = getattr(dxf, "defpoint3", None)
+        def _pt(name):
+            v = getattr(dxf, name, None)
+            return v  # Vec3 с нулевыми координатами — валидная точка; проверяем только на None
 
-        text_override = getattr(dxf, "text", "") or ""
+        p1 = _pt("defpoint2")
+        if p1 is None:
+            p1 = _pt("defpoint")
+        p2 = _pt("defpoint3")
+
+        text_override = (getattr(dxf, "text", "") or "").strip()
+        value_mm, value_source = measurement, "geometry"
+        override_mm = None
         if text_override and text_override != "<>":
             try:
-                value_mm = float(text_override.replace(",", "."))
-                value_source = "text_override"
+                override_mm = float(text_override.replace(",", ".").rstrip("*").strip())
+                value_mm, value_source = override_mm, "text_override"
             except ValueError:
-                value_mm = measurement
-                value_source = "geometry"
-        else:
-            value_mm = measurement
-            value_source = "geometry"
+                pass  # нечитаемый override ("46570*", "~46570") — остаётся геометрия
 
         if value_mm is None:
-            continue  # размер без geometрии и без читаемого override — пропускаем, а не гадаем
+            continue  # размер без геометрии и без читаемого override — пропускаем, а не гадаем
+
+        conflict = False
+        if override_mm is not None and measurement:
+            conflict = abs(override_mm - measurement) > 0.01 * max(abs(measurement), 1.0)
 
         dims.append({
             "layer": dxf.layer,
             "value_mm": round(value_mm, 1),
             "value_source": value_source,
-            "p1": [round(p1.x, 1), round(p1.y, 1)] if p1 else None,
-            "p2": [round(p2.x, 1), round(p2.y, 1)] if p2 else None,
+            "geometry_mm": round(measurement, 1) if measurement is not None else None,
+            "conflict": conflict,
+            "p1": [round(p1.x * k, 1), round(p1.y * k, 1)] if p1 is not None else None,
+            "p2": [round(p2.x * k, 1), round(p2.y * k, 1)] if p2 is not None else None,
         })
+    if notes is not None:
+        if skipped_types:
+            notes.append(f"Пропущено нелинейных размеров (угловые/радиальные/диаметральные и т.п.): {skipped_types}.")
+        nconf = sum(1 for d in dims if d["conflict"])
+        if nconf:
+            notes.append(f"Размеров, где надпись чертёжника расходится с геометрией больше чем на 1%: {nconf} "
+                         "(см. поля conflict / geometry_mm). Возможна ошибка в чертеже.")
     return dims
 
 
@@ -653,8 +783,9 @@ def _dwg_classify_dimensions(dims: list[dict], axes: list[dict], tol_mm: float =
     """Главный приём (проверен на реальном чертеже — см. докстринг модуля):
     размер с РОВНО ОДНОЙ точкой на известной оси — это искомая добавка
     (length_extra_*/width_extra_*), не нужно ни искать контур котлована, ни
-    гадать через vision, какой линии касается число. Обе точки на осях —
-    обычный межосевой пролёт. Ни одной — не относится к сетке осей вообще."""
+    гадать через vision, какой линии касается число. Обе точки на РАЗНЫХ осях —
+    обычный межосевой пролёт. Обе точки на одной и той же оси — не пролёт
+    (unrelated). Ни одной — не относится к сетке осей вообще."""
     def axis_at(pt):
         if not pt:
             return None
@@ -666,7 +797,9 @@ def _dwg_classify_dimensions(dims: list[dict], axes: list[dict], tol_mm: float =
 
     for d in dims:
         a1, a2 = axis_at(d["p1"]), axis_at(d["p2"])
-        if a1 and a2:
+        if a1 and a2 and a1 is a2:
+            d["kind"], d["from_axis"] = "unrelated", None
+        elif a1 and a2:
             d["kind"], d["from_axis"] = "inter_axis", None
         elif a1 or a2:
             d["kind"], d["from_axis"] = "axis_to_point", (a1 or a2)
@@ -678,7 +811,8 @@ def _dwg_classify_dimensions(dims: list[dict], axes: list[dict], tol_mm: float =
 _ELEV_RE = re.compile(r"^-?\d{1,3}[.,]\d{2,3}$")
 _SLOPE_RE = re.compile(r"^\d+\s*[:xх]\s*[\d.,]+$", re.IGNORECASE)
 _STATED_VOLUME_RE = re.compile(
-    r"объ[её]м[а-я\s]*грунта[а-я\s:]*?(\d[\d\s]*[.,]?\d*)\s*м", re.IGNORECASE
+    r"объ[её]м[а-я\s]*грунта[а-я\s:\-–—=]*?(\d[\d\s]*[.,]?\d*)\s*(м\s*³|м\s*3|м\s*\^?\s*3|куб\.?\s*м|м\s*²|м\s*2)",
+    re.IGNORECASE,
 )
 
 
@@ -725,7 +859,7 @@ def _dwg_extract_depth_slope(msp) -> dict:
 
         if stated_volume is None:
             m = _STATED_VOLUME_RE.search(text)
-            if m:
+            if m and not re.search(r"м\s*(²|2)", m.group(2)):  # площадь (м²) — не объём
                 raw = m.group(1).replace(" ", "").replace(",", ".")
                 try:
                     stated_volume = {"value_m3": float(raw), "quote": text[:300]}
@@ -757,6 +891,7 @@ def _dwg_extract_piles(msp) -> dict:
     пропусков — довольно характерный, легко отличимый паттерн от случайных
     чисел на чертеже)."""
     numbers = []
+    excluded_numbers = 0
     marks = {}
     ranges = []
     cut_elev = None
@@ -768,13 +903,24 @@ def _dwg_extract_piles(msp) -> dict:
         if not text:
             continue
 
-        if _PILE_NUM_RE.match(text):
-            numbers.append(int(text))
+        layer_lower = (e.dxf.layer or "").lower()
+        # подписи осей и размерные слои — не номера свай (раньше номера осей
+        # 1..18 попадали в счёт, если свай с такими номерами не было)
+        is_axis_or_dim_layer = any(h in layer_lower for h in DWG_AXIS_LAYER_HINTS) or "dim" in layer_lower or "размер" in layer_lower
+
+        if _PILE_NUM_RE.match(text) and len(text) <= 6:
+            if is_axis_or_dim_layer:
+                excluded_numbers += 1
+            else:
+                numbers.append(int(text))
 
         m = _PILE_MARK_RE.match(text)
         if m:
             length_dm, section_cm = int(m.group(1)), int(m.group(2))
-            marks[(length_dm, section_cm)] = {
+            # ключ — полная марка (С100-35-10 и С100-35-11 — разные позиции),
+            # а не только длина+сечение
+            mark_key = re.sub(r"\s+", "", text.upper())
+            marks[mark_key] = {
                 "text": text, "length_m": length_dm / 10, "section_m": section_cm / 100,
             }
 
@@ -803,11 +949,25 @@ def _dwg_extract_piles(msp) -> dict:
     has_gaps = None
     if unique_numbers:
         has_gaps = unique_numbers != list(range(unique_numbers[0], unique_numbers[-1] + 1))
+    # значения, подписанные более одного раза: либо дубль подписи, либо две
+    # сваи с одним номером — в любом случае инженеру стоит посмотреть
+    counts: dict = {}
+    for n in numbers:
+        counts[n] = counts.get(n, 0) + 1
+    duplicates = sorted(n for n, c in counts.items() if c > 1)[:30]
+    # длина непрерывного ряда 1..N — второй независимый признак «это нумерация свай»
+    contiguous_from_1 = 0
+    nums_set = set(unique_numbers)
+    while (contiguous_from_1 + 1) in nums_set:
+        contiguous_from_1 += 1
 
     return {
         "count": len(unique_numbers),
         "number_range": [unique_numbers[0], unique_numbers[-1]] if unique_numbers else None,
         "has_gaps": has_gaps,
+        "contiguous_from_1": contiguous_from_1,
+        "duplicate_numbers": duplicates,
+        "excluded_axis_or_dim_numbers": excluded_numbers,
         "marks": list(marks.values()),
         "spec_ranges": ranges,
         "cut_elevation": cut_elev,
@@ -821,17 +981,21 @@ def _dwg_extract(request: Request, headers: dict):
         return (jsonify({"error": "Поле 'file' (DWG) не найдено в запросе"}), 400, headers)
 
     upload = request.files["file"]
+    size_err = _check_upload_size(upload)
+    if size_err:
+        return (jsonify({"error": size_err}), 413, headers)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         dwg_path = os.path.join(tmpdir, "input.dwg")
         upload.save(dwg_path)
 
         try:
-            dxf_path = _dwg_to_dxf(dwg_path, tmpdir)
+            dxf_path, conv_warnings = _dwg_to_dxf(dwg_path, tmpdir)
         except FileNotFoundError:
             # dwg2dxf не найден в PATH — образ ещё не пересобран с LibreDWG.
             return (jsonify({"error": "dwg2dxf не установлен в образе — см. инструкцию по добавлению LibreDWG в Dockerfile"}), 500, headers)
         except (RuntimeError, subprocess.SubprocessError, subprocess.TimeoutExpired) as e:
+            logger.exception("dwg2dxf failed")
             return (jsonify({"error": f"Не удалось сконвертировать DWG в DXF: {e}"}), 400, headers)
 
         try:
@@ -840,13 +1004,28 @@ def _dwg_extract(request: Request, headers: dict):
             return (jsonify({"error": f"ezdxf не смог прочитать сконвертированный DXF: {e}"}), 500, headers)
 
         msp = doc.modelspace()
-        axes = _dwg_extract_axes(msp)
-        dims = _dwg_extract_dimensions(msp)
+        k, units_info = _dwg_units_scale(doc)
+        extract_notes: list[str] = list(conv_warnings)
+        if units_info["assumed"]:
+            extract_notes.append(
+                f"В файле не задан/неизвестен $INSUNITS={units_info['insunits']} — единицы чертежа приняты за мм. "
+                "Если чертёж в метрах, все размеры будут неверны в 1000 раз."
+            )
+        elif k != 1.0:
+            extract_notes.append(f"Единицы чертежа ($INSUNITS={units_info['insunits']}) приведены к мм (×{k}).")
+        axes = _dwg_extract_axes(msp, k, extract_notes)
+        dims = _dwg_extract_dimensions(msp, k, extract_notes)
         dims = _dwg_classify_dimensions(dims, axes)
+        n_blocks = sum(1 for _ in msp.query("INSERT"))
+        if n_blocks:
+            extract_notes.append(
+                f"В модели {n_blocks} вставок блоков (INSERT): размеры и подписи внутри блоков, а также на листах "
+                "(layouts) НЕ разбираются — если данных не хватает, проверьте вручную."
+            )
         depth_slope = _dwg_extract_depth_slope(msp)
         piles = _dwg_extract_piles(msp)
 
-    warnings: list[str] = []
+    warnings: list[str] = list(extract_notes)
     if not axes:
         warnings.append(
             "Оси не найдены по известным названиям слоёв (DWG_AXIS_LAYER_HINTS) — "
@@ -867,6 +1046,7 @@ def _dwg_extract(request: Request, headers: dict):
         "slope_candidates": depth_slope["slope_candidates"],
         "stated_volume": depth_slope["stated_volume"],
         "piles": piles,
+        "units": units_info,
     }), 200, headers)
 
 
@@ -894,15 +1074,21 @@ def extract_and_verify_tables(request: Request):
         return (jsonify({"error": "Поле 'file' (PDF) не найдено в запросе"}), 400, headers)
 
     upload = request.files["file"]
+    size_err = _check_upload_size(upload)
+    if size_err:
+        return (jsonify({"error": size_err}), 413, headers)
     section_code = request.form.get("section_code", "")
     pages = request.form.get("pages", "")  # опционально: "1,3,5-7"
     # Плотность материала для резервной оценки объёма по массе (кг/м3).
     # По умолчанию — тяжёлый бетон/ж/б (2500). Для металлопроката, например,
     # нужно передать 7850.
+    raw_density = request.form.get("density_kg_m3", "") or "2500"
     try:
-        density_kg_m3 = float(request.form.get("density_kg_m3", "2500") or 2500)
+        density_kg_m3 = float(str(raw_density).replace(",", "."))
+        if not math.isfinite(density_kg_m3) or density_kg_m3 <= 0:
+            raise ValueError
     except ValueError:
-        density_kg_m3 = 2500.0
+        return (jsonify({"error": f"Некорректная плотность density_kg_m3={raw_density!r} (нужно число > 0)"}), 400, headers)
 
     warnings: list[str] = []
 
@@ -913,10 +1099,13 @@ def extract_and_verify_tables(request: Request):
         try:
             kwargs = dict(input_path=pdf_path, output_dir=tmpdir, format="json", quiet=True, table_method="cluster")
             if pages:
+                if not re.fullmatch(r"[0-9,\-\s]+", pages):
+                    return (jsonify({"error": f"Некорректный параметр pages: {pages!r}"}), 400, headers)
                 kwargs["pages"] = pages
             opendataloader_pdf.convert(**kwargs)
         except Exception as e:
-            return (jsonify({"error": f"Ошибка OpenDataLoader: {e}", "trace": traceback.format_exc()}), 500, headers)
+            logger.exception("OpenDataLoader failed")  # трассировка — только в лог, не клиенту
+            return (jsonify({"error": f"Ошибка OpenDataLoader: {e}"}), 500, headers)
 
         json_path = os.path.join(tmpdir, "input.json")
         if not os.path.exists(json_path):
@@ -930,10 +1119,18 @@ def extract_and_verify_tables(request: Request):
 
     out_tables = []
     for t in tables_raw:
-        grid = _grid(t)
+        try:
+            grid = _grid(t)
+        except ValueError as e:
+            warnings.append(f"Таблица {t.get('id')}: {e}")
+            continue
         # пропускаем совсем маленький мусор (2x2 "таблицы" — обычно это
-        # ложные срабатывания на подписях чертежа, не настоящие таблицы)
-        if t.get("number of rows", 0) < 3 or t.get("number of columns", 0) < 2:
+        # ложные срабатывания на подписях чертежа, не настоящие таблицы).
+        # Размеры считаем по самой сетке, а не только по метаданным ODL: если
+        # ключи "number of rows/columns" переименуют, таблицы не пропадут молча.
+        n_rows = len(grid)
+        n_cols = max((len(r) for r in grid), default=0)
+        if n_rows < 3 or n_cols < 2:
             continue
         report = verify_table(t)
 
@@ -944,6 +1141,9 @@ def extract_and_verify_tables(request: Request):
         mass_estimate = None
         if not report.checks:
             est = estimate_volume_from_mass(grid, density_kg_m3=density_kg_m3)
+            if est is not None and est.needs_confirmation:
+                warnings.append(f"Таблица {t.get('id')}: оценка по массе не выдана — {est.needs_confirmation}")
+                est = None
             if est is not None:
                 mass_estimate = {
                     "note": "Итоговой строки в таблице нет — объём получен расчётом "
@@ -956,6 +1156,10 @@ def extract_and_verify_tables(request: Request):
                     "volume_m3": est.volume_m3,
                     "rows_used": est.rows_used,
                     "rows_skipped": est.rows_skipped,
+                    "mass_unit": est.mass_unit,
+                    "header_rows": est.header_rows,
+                    "skipped_rows": est.skipped_rows,
+                    "warnings": est.warnings,
                 }
 
         out_tables.append({
@@ -965,12 +1169,17 @@ def extract_and_verify_tables(request: Request):
             "cols": t.get("number of columns"),
             "grid": grid,
             "verification": {
+                "status": report.status,  # passed | mismatch | nothing_to_verify
                 "all_match": report.all_match,
+                "notes": report.notes,
+                "unparsed_cells": len(report.unparsed_cells),
+                "skipped_columns": report.skipped_columns,
                 "checks": [
                     {
                         "kind": c.kind, "label": c.label,
                         "stated": c.stated, "computed": c.computed,
-                        "match": c.match,
+                        "match": c.match, "tolerance": c.tolerance,
+                        "column": c.column, "cells": c.cells,
                     }
                     for c in report.checks
                 ],
@@ -978,4 +1187,6 @@ def extract_and_verify_tables(request: Request):
             "mass_estimate": mass_estimate,
         })
 
+    if tables_raw and not out_tables:
+        warnings.append(f"Найдено таблиц: {len(tables_raw)}, но все отфильтрованы как слишком малые или нечитаемые.")
     return (jsonify({"tables": out_tables, "warnings": warnings, "section_code": section_code}), 200, headers)
